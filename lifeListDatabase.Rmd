@@ -1,0 +1,311 @@
+---
+title: "Constructing a Database from eBird Life List"
+author: "Andrew Cameron"
+date: "2023-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Basic database to contain three tables
+
+Much more can be added by utilizing eBird API to access the specific checklist from which the sighting came.
+
+1. Species Table
+
+    Fields:
+        SpeciesID (primary key): Unique identifier for each species.
+        CommonName: Common name of the bird.
+        ScientificName: Scientific name of the bird.
+        Family: Taxonomic family to which the bird belongs.
+        ConservationStatus: Current conservation status (e.g., endangered, vulnerable).  [awaiting IUCN database access]
+
+2. Observations Table
+
+    Fields:
+        ObservationID (primary key): Unique identifier for each observation.
+        SpeciesID (foreign key): Links to the Species Table.
+        Date: Date of the observation.
+        LocationID (foreign key): Links to the Locations Table.
+        ChecklistID (foreign key): Links to Checklist Table
+
+3. Locations Table
+
+    Fields:
+        LocationID (primary key): Unique identifier for each location.  (eBird LocID field)
+        Name: Name of the location (e.g., national park, nature reserve).
+        Latitude: Latitude coordinate of the location.
+        Longitude: Longitude coordinate of the location.
+        Biome:
+        SubBiome:
+        
+4. Checklist Table
+    
+    Fields: 
+        ChecklistID (primary key)
+        Duration:
+        NumSpecies:
+        Date:
+        Weather:
+          temp:
+          wind:
+          precip:
+          cloudcover:
+        LocationID (foreign key): Links to Locations Table
+        
+        
+
+```{r}
+library(dplyr)
+library(rebird)
+
+lifelist <- readr::read_csv("lifelist.csv")
+
+# Exclude non-species-level records and exotics/escapes
+lifelist <- lifelist %>%
+  slice(-(867:nrow(lifelist))) %>%
+  mutate(`Row #` = row_number())
+
+# Set ObservationID field
+lifelist <- lifelist %>%
+  mutate(ObsID = sort(`Row #`, decreasing = TRUE))
+
+# Ensure all NN Park obs have same LocID
+lifelist[lifelist$Location == "Newport News Park", "LocID"] <- "L718631"
+                              
+```
+
+## Derive X,Y Coords for Locations
+
+Lat/long data will be stored in 'Location Table' of database
+
+Start with low hanging fruit: official hotspots.
+```{r `FUNC hotspot coord`}
+
+## ---- Custom func to return single-row df with x and y coords based on hotspot LocID
+hotspot_xy <- function(hotspot_id) {
+  
+  info <- tryCatch(ebirdregioninfo(hotspot_id), 
+                   error = function(e) {
+    NULL  # If error, just return NULL
+  })
+
+  # Check if info is NULL
+  if (is.null(info)) {
+    # Return df with NAs if there was an error
+    return(data.frame(LocID = hotspot_id,
+                      lat = NA,
+                      long = NA))
+  } else {
+    # Extract coordinates and return them if no error occurred
+    y_coord <- info$latitude
+    x_coord <- info$longitude
+    return(data.frame(LocID = hotspot_id,
+                      lat = y_coord,
+                      long = x_coord))
+  }
+}
+
+
+## ----- Apply custom func to get xy data from official hotspots
+# df to hold location ID and resultant xy data
+locations <- as.data.frame(unique(lifelist$LocID))
+colnames(locations)[1] <- "LocID"
+
+
+for (i in 1:nrow(locations)) {
+  coords <- hotspot_xy(locations$LocID[i])
+  
+  locations$lat[i] <- coords$lat
+  locations$long[i] <- coords$long
+}
+
+```
+
+Many observations are not tied to recognized hotspots and thus require a bit more leg work to access their location data
+
+* Some Loc names have xy data in the name -- use regex and stringr to extract those late/long strings
+
+```{r `get missing coords`}
+library(stringr)
+
+# Subset locations that still lack spatial data
+loc_noCoords <- locations %>%
+  filter(is.na(lat)) %>%
+  left_join(lifelist %>%
+              group_by(LocID) %>%
+              slice_head() %>%
+              select(Location, LocID), by = "LocID")
+
+#  Define regex pattern to identify lat and long strings
+pattern <- "-?\\d+\\.\\d+,\\s*-?\\d+\\.\\d+"
+
+loc_noCoords$extractedCoords <- str_extract(loc_noCoords$Location, pattern)
+
+# Split string so lat and long are separated; this creates list object
+coords_split <- str_split(loc_noCoords$extractedCoords, ",")
+
+for (i in 1:nrow(loc_noCoords)) {
+  if (!is.na(coords_split[[i]][1])) {
+    loc_noCoords$lat[i] <- as.numeric(coords_split[[i]][1])
+    loc_noCoords$long[i] <- as.numeric(coords_split[[i]][2])
+  } else {
+    loc_noCoords$lat[i] <- NA
+    loc_noCoords$long[i] <- NA
+  }
+}
+
+
+## ---- 19 locations still lack coordinates. They will need to be seek out coords manually.
+stillMissing <- loc_noCoords %>%
+  filter(is.na(lat))
+
+# Spatial data obtained from eBird My Locations page, manually
+missingXY_vec <- c("-40.430443603861484, -71.52732714595885",
+                   "21.962500388966415, -80.06262240958718",
+                   "37.01274054205935, -76.45330601760207",
+                   "-34.40817439312428, -58.58968011287809",
+                   "38.96130967755057, -78.73640236441761", #5  George Washington 
+                   "36.89192374233853, -76.44309073294882",
+                   "-25.599437557304018, -54.56900095919036",
+                   "32.1168246, -110.478799",
+                   "31.8657879, -109.4118481",
+                   "31.8610354, -109.3382328",  #10
+                   "31.970572, -109.3321154",
+                   "18.373368, -68.815373",
+                   "18.70751, -68.44678",
+                   "-33.4984608, -58.7883568",
+                   "-23.7007266, -65.6840385",    # 15 Cuesta de Lipan
+                   "-34.5230615, -58.4680527",  
+                   "42.4587784, -73.3565011",
+                   "37.0455199, -76.4641169",   
+                   "-34.9688638, -58.5851879"   # 19 Estancia Villa Maria
+   
+                                   )
+stillMissing$extractedCoords <- missingXY_vec
+
+# Apply same str_split approach as above
+coords_split <- str_split(stillMissing$extractedCoords, ",")
+
+for (i in 1:nrow(stillMissing)) {
+    stillMissing$lat[i] <- as.numeric(coords_split[[i]][1])
+    stillMissing$long[i] <- as.numeric(coords_split[[i]][2])
+}
+
+# Join all coords together in singl df
+loc1 <- locations %>%
+  filter(!LocID %in% loc_noCoords$LocID)
+
+loc2 <- loc_noCoords %>%
+  filter(!is.na(lat)) %>%
+  rbind(stillMissing) %>%
+  select(LocID, lat, long)
+
+loc_coords <- rbind(loc1, loc2)
+
+# Join coords to life listd df
+lifelist <- lifelist %>%
+  left_join(loc_coords, by = "LocID")
+  
+
+```
+
+## Collect Weather Data
+
+Weather data will be incorporated into the 'Checklist Table'.
+
+### API Wrapper & Other Functions
+
+`rebird` currently has no wrapper for accessing specific checklist information. This function accesses a checklist based on SubID field from life list, then extracts the weather
+
+```{r `get Checklist wrapper`}
+library(httr)
+library(jsonlite)
+
+api_token <- "jrel4sdsnpqv"
+
+## -- Custom func to get checklist info using eBird api
+getChecklist <- function(subId) {
+    url <- paste0("https://api.ebird.org/v2/product/checklist/view/", subId)
+    response <- httr::GET(url, httr::add_headers(`X-eBirdApiToken` = api_token))
+    if (httr::status_code(response) == 200) {
+        data <- jsonlite::fromJSON(httr::content(response, "text", encoding = "UTF-8"))
+        return(data)
+    } else {
+        stop("Failed to fetch data: ", httr::status_code(response))
+    }
+}
+
+```
+
+```{r `FUNC getWeather`}
+## ------- Custom func to get weather information given an eBird checklist as input
+getWeather <- function(checklist) {
+  locid <- checklist$locId
+  coords.df <- lifelist %>%
+    filter(LocID == locid)
+
+  lat <- as.vector(unlist(coords.df[1, "lat"]))
+  long <- as.vector(unlist(coords.df[1, "long"]))
+  
+  obs_datetime <- checklist$obsDt
+  obs_POSIXct <- as.POSIXct(obs_datetime)
+  
+  split_datetime <- strsplit(obs_datetime, " ")
+  obsDate <- unlist(split_datetime)[1]
+  
+  # Open-Meteo API to get historical weather records
+  weatherInfo <- openmeteo::weather_history(location = c(lat, long), 
+                                            start = obsDate, 
+                                            end = obsDate, 
+                                            hourly = c("temperature_2m", "windspeed_10m", "cloudcover", "precipitation")
+                                            )
+  
+  weatherInfo$datetime_char <- as.character(weatherInfo$datetime)
+  
+  # Round the checklist time to nearest hour to be able to match with a datetime from the hourly weather output
+  rounded_obsTime <- as.character(round(obs_POSIXct, units = "hours"))
+  
+ weatherInfo <- weatherInfo %>%
+    filter(datetime_char == rounded_obsTime) %>%
+    select(-datetime, -datetime_char)
+  
+ return(weatherInfo)
+}
+  
+```
+
+```{r `pull in weather data`}
+# Create df to hold weather data with unique identifier
+weather.df <- data.frame(checklistID = unique(lifelist$SubID),
+                         hourly_temperature_2m = NA,
+                         hourly_windspeed_10m = NA,
+                         hourly_cloudcover = NA,
+                         hourly_precipitation = NA)
+
+
+# Utilize custom functions in for loop to access weather data for each checklist
+for (i in seq_along(unique(lifelist$SubID))) {
+  subID <- unique(lifelist$SubID)[i]
+  checklist <- getChecklist(subID)
+  weather <- tryCatch(getWeather(checklist),
+                      error = function(e) {
+                        cat("Error in iteration:", i, "\n checklist:", subID)
+                      }
+  )
+  
+  weather.df$hourly_temperature_2m[i] <- weather$hourly_temperature_2m
+  weather.df$hourly_windspeed_10m[i] <- weather$hourly_windspeed_10m
+  weather.df$hourly_cloudcover[i] <- weather$hourly_cloudcover
+  weather.df$hourly_precipitation[i] <- weather$hourly_precipitation
+}
+  
+```
+
+## Biome & Subbiome for Obs. Locations
+
+A vector map of the entire earth divided into biotic units (bioms and subbiomes) is available in the journal Vegetation Classification and Survey (article: *A vector map of the world’s terrestrial biotic units: subbiomes, biomes, ecozones and domains* by Javier Loidi, Gonzalo Navarro-Sánchez, & Denys Vynokurov).
+
+Using a straightforward spatial join, I determined the biome and subbiome within which each observation location falls. This information will be used in the 'Location Table' of the database.
