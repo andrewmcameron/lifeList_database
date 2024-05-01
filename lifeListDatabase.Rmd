@@ -9,53 +9,59 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-Basic database to contain three tables
+## Databse structure
 
-Much more can be added by utilizing eBird API to access the specific checklist from which the sighting came.
+```{DBML, eval=false}
 
-1. Species Table
+REATE TABLE "species" (
+  "species_id" integer PRIMARY KEY,
+  "common_name" varcahr,
+  "banding_code" varchar,
+  "scientific_name" varchar,
+  "family" varchar,
+  "conservation_status" varchar,
+  "obs_id" integer
+);
 
-    Fields:
-        SpeciesID (primary key): Unique identifier for each species.
-        CommonName: Common name of the bird.
-        ScientificName: Scientific name of the bird.
-        Family: Taxonomic family to which the bird belongs.
-        ConservationStatus: Current conservation status (e.g., endangered, vulnerable).  [awaiting IUCN database access]
+CREATE TABLE "observations" (
+  "obs_id" integer PRIMARY KEY,
+  "common_name" varcahr,
+  "date" date,
+  "loc_id" varchar,
+  "checklist_id" varchar
+);
 
-2. Observations Table
+CREATE TABLE "locations" (
+  "loc_id" varchar PRIMARY KEY,
+  "name" varchar,
+  "lat" double,
+  "long" double,
+  "biome" varchar,
+  "ecoregion" varchar
+);
 
-    Fields:
-        ObservationID (primary key): Unique identifier for each observation.
-        SpeciesID (foreign key): Links to the Species Table.
-        Date: Date of the observation.
-        LocationID (foreign key): Links to the Locations Table.
-        ChecklistID (foreign key): Links to Checklist Table
+CREATE TABLE "checklists" (
+  "checklist_id" varchar PRIMARY KEY,
+  "duration" integer,
+  "num_species" integer,
+  "date" date,
+  "temperature" float,
+  "wind" float,
+  "precipitation" float,
+  "cloudcover" float,
+  "loc_id" varchar
+);
 
-3. Locations Table
+ALTER TABLE "observations" ADD FOREIGN KEY ("obs_id") REFERENCES "species" ("obs_id");
 
-    Fields:
-        LocationID (primary key): Unique identifier for each location.  (eBird LocID field)
-        Name: Name of the location (e.g., national park, nature reserve).
-        Latitude: Latitude coordinate of the location.
-        Longitude: Longitude coordinate of the location.
-        Biome:
-        SubBiome:
-        
-4. Checklist Table
-    
-    Fields: 
-        ChecklistID (primary key)
-        Duration:
-        NumSpecies:
-        Date:
-        Weather:
-          temp:
-          wind:
-          precip:
-          cloudcover:
-        LocationID (foreign key): Links to Locations Table
-        
-        
+ALTER TABLE "locations" ADD FOREIGN KEY ("loc_id") REFERENCES "observations" ("loc_id");
+
+ALTER TABLE "checklists" ADD FOREIGN KEY ("checklist_id") REFERENCES "observations" ("checklist_id");
+
+ALTER TABLE "locations" ADD FOREIGN KEY ("loc_id") REFERENCES "checklists" ("loc_id");
+
+```
+
 
 ```{r}
 library(dplyr)
@@ -306,6 +312,57 @@ for (i in seq_along(unique(lifelist$SubID))) {
 
 ## Biome & Subbiome for Obs. Locations
 
-A vector map of the entire earth divided into biotic units (bioms and subbiomes) is available in the journal Vegetation Classification and Survey (article: *A vector map of the world’s terrestrial biotic units: subbiomes, biomes, ecozones and domains* by Javier Loidi, Gonzalo Navarro-Sánchez, & Denys Vynokurov).
+ArcGIS has an excellent biomes and ecoregions layer (2017). Exported as shapefile to bring into R.
+(Initial vector layer downloaded from journal was inadequate for the task -- inaccurate drawn boundaries at small scale and many birds were not captured in the spatial join)
 
 Using a straightforward spatial join, I determined the biome and subbiome within which each observation location falls. This information will be used in the 'Location Table' of the database.
+
+```{r}
+# Read in biome vectors and covert to sf object
+shp <- st_read("biomes_ecoregions/biomes.shp")
+biomes_sf <- st_as_sf(shp)
+
+# Convert life list to sf object
+lifers_sf <- st_as_sf(lifelist, coords = c("long", "lat"), crs = 4326)
+
+# Intersect
+lifelist_biomes <- st_intersection(lifers_sf, biomes_sf)
+
+# Still some points not captured in intersection (70 obs total)
+## This process took forever (stopped it after 10 min) -- much more efficient to export lifers as shp and run the join in ArcGIS Pro
+lifers_biomes <- st_is_within_distance(lifers_sf, biomes_sf, dist = 2000)
+
+```
+
+
+
+The below chunk shows my initial attempt to join the life list points to the biome vectors, and how to resolve the initital error I encountered. This couldn't overcome, however, the low precision boundaries and loss of points during the intersection.
+
+```{r `dealing with 'Loop 0' error` eval = FALSE}
+shp <- st_read("globalBiomes/biomes_world.shp")
+biomes_sf <- st_as_sf(shp)
+
+lifers_sf <- st_as_sf(lifelist, coords = c("long", "lat"), crs = 4326)
+
+
+## Initital attempt at intersection returned
+    ### Error in wk_handle.wk_wkb(wkb, s2_geography_writer(oriented = oriented,  : 
+    ### Loop 0 is not valid: Edge 172 crosses edge 174
+## "The only remedy is to turn off spherical geometry, rebuild the geometry with st_make_valid() as planar geometry, then crop as planar geometry, even when the geometries are really spherical, and the bounding box should be curvilinear, not rectangular. See: https://r-spatial.org/r/2020/06/17/s2.html and #1771." from github
+
+sf_use_s2(FALSE)
+biomes_valid <- st_make_valid(biomes_sf)
+biomes_planar <- st_crop(biomes_valid, xmin = -180, ymin = -90, xmax = 0, ymax = 90)  # made bbox western hemisphere only, given my travels
+
+lifelist_biomes <- st_intersection(lifers_sf, biomes_planar)
+
+x <- lifelist_biomes$ObsID
+
+indices_failedIntersect <- which(!lifelist$ObsID %in% x)
+
+y <- lifelist %>%
+  filter(ObsID %in% indices_failedIntersect)
+
+y # <-- 102 points are being lost during the intersection operation. Not clear why.
+
+```
